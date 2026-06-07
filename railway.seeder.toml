@@ -1,5 +1,5 @@
 [build]
-builder = "railpack"
+builder = "NIXPACKS"
 
 [deploy]
 startCommand = "sh scripts/run-seeders.sh"
