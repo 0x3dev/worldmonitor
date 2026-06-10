@@ -12,4 +12,6 @@ COPY . .
 # Seeders pull a few deps from scripts/package.json
 RUN npm install --prefix scripts --no-audit --no-fund
 
-CMD ["sh", "scripts/run-seeders.sh"]
+# Curated Railway list (tracked in-repo) — not run-seeders.sh, which sweeps
+# every seed-*.mjs including domains this deployment doesn't serve.
+CMD ["sh", "scripts/run-seeders-railway.sh"]
