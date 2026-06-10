@@ -14022,7 +14022,7 @@ function selectForecastsForEnrichment(predictions, options = {}) {
 
 // ── Phase 2: LLM Scenario Enrichment ───────────────────────
 const FORECAST_LLM_PROVIDERS = [
-  { name: 'groq', envKey: 'GROQ_API_KEY', apiUrl: 'https://api.groq.com/openai/v1/chat/completions', model: 'llama-3.3-70b-versatile', timeout: 30_000 },
+  { name: 'groq', envKey: 'GROQ_API_KEY', apiUrl: 'https://api.groq.com/openai/v1/chat/completions', model: 'llama-3.1-8b-instant', timeout: 20_000 },
   { name: 'openrouter', envKey: 'OPENROUTER_API_KEY', apiUrl: 'https://openrouter.ai/api/v1/chat/completions', model: 'google/gemini-2.5-flash', timeout: 25_000 },
 ];
 const FORECAST_LLM_PROVIDER_NAMES = new Set(FORECAST_LLM_PROVIDERS.map(provider => provider.name));
@@ -14329,41 +14329,60 @@ async function callForecastLLM(systemPrompt, userPrompt, options = {}) {
     : providers.map(provider => provider.name).join(',');
   console.log(`  [LLM:${stage}] providerOrder=${requestedOrder} modelOverrides=${JSON.stringify(options.modelOverrides || {})}`);
 
+  // 429s here are usually per-minute token-window exhaustion (e.g. Groq's
+  // 12k TPM on free tier) hit by a burst of stages within one run — the
+  // window clears in seconds, so honoring retry-after almost always
+  // succeeds. Daily-quota 429s carry a huge retry-after; the cap makes us
+  // give up on those quickly instead of stalling the whole seed run.
+  const MAX_429_RETRIES = 3;
+  const RETRY_AFTER_CAP_S = 120;
   for (const provider of providers) {
     const apiKey = process.env[provider.envKey];
     if (!apiKey) continue;
-    try {
-      const resp = await fetch(provider.apiUrl, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-          'User-Agent': CHROME_UA,
-          ...(provider.name === 'openrouter' ? { 'HTTP-Referer': 'https://worldmonitor.app', 'X-Title': 'World Monitor' } : {}),
-        },
-        body: JSON.stringify({
-          model: provider.model,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt },
-          ],
-          max_tokens: options.maxTokens || 1500,
-          temperature: options.temperature ?? 0.3,
-        }),
-        signal: AbortSignal.timeout(provider.timeout),
-      });
-      if (!resp.ok) {
-        console.warn(`  [LLM:${stage}] ${provider.name} HTTP ${resp.status}`);
-        continue;
+    for (let attempt = 0; attempt <= MAX_429_RETRIES; attempt++) {
+      try {
+        const resp = await fetch(provider.apiUrl, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+            'User-Agent': CHROME_UA,
+            ...(provider.name === 'openrouter' ? { 'HTTP-Referer': 'https://worldmonitor.app', 'X-Title': 'World Monitor' } : {}),
+          },
+          body: JSON.stringify({
+            model: provider.model,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userPrompt },
+            ],
+            max_tokens: options.maxTokens || 1500,
+            temperature: options.temperature ?? 0.3,
+          }),
+          signal: AbortSignal.timeout(provider.timeout),
+        });
+        if (resp.status === 429 && attempt < MAX_429_RETRIES) {
+          const retryAfterS = Math.min(
+            Number(resp.headers.get('retry-after')) || 15 * (attempt + 1),
+            RETRY_AFTER_CAP_S,
+          );
+          console.warn(`  [LLM:${stage}] ${provider.name} HTTP 429 — retrying in ${retryAfterS}s (${attempt + 1}/${MAX_429_RETRIES})`);
+          await new Promise(resolve => setTimeout(resolve, retryAfterS * 1000));
+          continue;
+        }
+        if (!resp.ok) {
+          console.warn(`  [LLM:${stage}] ${provider.name} HTTP ${resp.status}`);
+          break;
+        }
+        const json = await resp.json();
+        const text = json.choices?.[0]?.message?.content?.trim();
+        if (!text || text.length < 20) break;
+        const model = json.model || provider.model;
+        console.log(`  [LLM:${stage}] ${provider.name} success model=${model}`);
+        return { text, model, provider: provider.name };
+      } catch (err) {
+        console.warn(`  [LLM:${stage}] ${provider.name} ${err.message}`);
+        break;
       }
-      const json = await resp.json();
-      const text = json.choices?.[0]?.message?.content?.trim();
-      if (!text || text.length < 20) continue;
-      const model = json.model || provider.model;
-      console.log(`  [LLM:${stage}] ${provider.name} success model=${model}`);
-      return { text, model, provider: provider.name };
-    } catch (err) {
-      console.warn(`  [LLM:${stage}] ${provider.name} ${err.message}`);
     }
   }
   return null;
