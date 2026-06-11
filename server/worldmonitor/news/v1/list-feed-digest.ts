@@ -381,8 +381,13 @@ interface ParseResult {
 // split, a single upstream-CF-challenge or transient outage would pin the
 // panel to "No news available" for the full hour. 5min keeps load on
 // upstream bounded while still recovering quickly when upstream heals.
-const CACHE_TTL_HEALTHY_S = 3600;
-const CACHE_TTL_EMPTY_S = 300;
+// Both env-overridable so a deployment can trade upstream RSS load for
+// freshness (e.g. NEWS_FEED_TTL_HEALTHY_S=600 polls healthy feeds every
+// 10 min instead of hourly). Defaults preserve the historical behaviour.
+const CACHE_TTL_HEALTHY_S = Number(process.env.NEWS_FEED_TTL_HEALTHY_S ?? 3600);
+const CACHE_TTL_EMPTY_S = Number(process.env.NEWS_FEED_TTL_EMPTY_S ?? 300);
+/** TTL of the assembled per-variant digest response (NEWS_DIGEST_TTL_S). */
+const DIGEST_CACHE_TTL_S = Number(process.env.NEWS_DIGEST_TTL_S ?? 900);
 
 async function fetchAndParseRss(
   feed: ServerFeed,
@@ -1006,7 +1011,7 @@ export async function listFeedDigest(
     // neg-sentinel (120s) to absorb the request storm during degraded periods.
     const fresh = await cachedFetchJson<ListFeedDigestResponse>(
       digestCacheKey,
-      900,
+      DIGEST_CACHE_TTL_S,
       async () => {
         const result = await buildDigest(variant, lang);
         const totalItems = Object.values(result.categories).reduce((sum, b) => sum + b.items.length, 0);
