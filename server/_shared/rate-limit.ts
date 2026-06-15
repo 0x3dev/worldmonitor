@@ -126,6 +126,12 @@ export interface RateLimitOptions {
 }
 
 export async function checkRateLimit(request: Request, corsHeaders: Record<string, string>, opts: RateLimitOptions = {}): Promise<Response | null> {
+  // Self-host opt-out (see api/_rate-limit.js for the full rationale): on a
+  // private, single-consumer instance per-IP limiting has no threat model and
+  // is harmful — internal traffic has no trusted client-IP header so every
+  // request collapses into one shared bucket. Allow everything when set.
+  if (process.env.RATE_LIMIT_DISABLED === 'true') return null;
+
   const rl = getRatelimit();
   if (!rl) {
     if (opts.failClosed) {
@@ -230,6 +236,7 @@ export function hasEndpointRatePolicy(pathname: string): boolean {
 }
 
 export async function checkEndpointRateLimit(request: Request, pathname: string, corsHeaders: Record<string, string>, opts: RateLimitOptions = {}): Promise<Response | null> {
+  if (process.env.RATE_LIMIT_DISABLED === 'true') return null;
   if (!hasEndpointRatePolicy(pathname)) return null;
 
   const rl = getEndpointRatelimit(pathname);
@@ -315,6 +322,7 @@ export interface ScopedRateLimitResult {
  * windows are visible in logs / Sentry.
  */
 export async function checkScopedRateLimit(scope: string, limit: number, window: Duration, identifier: string): Promise<ScopedRateLimitResult> {
+  if (process.env.RATE_LIMIT_DISABLED === 'true') return { allowed: true, limit, reset: 0, degraded: false };
   const rl = getScopedRatelimit(scope, limit, window);
   if (!rl) return { allowed: true, limit, reset: 0, degraded: true };
   try {
