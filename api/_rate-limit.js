@@ -113,6 +113,15 @@ function rateLimitDegradedResponse(corsHeaders) {
  *   isolate teardown. (#3531)
  */
 export async function checkRateLimit(request, corsHeaders, opts = {}) {
+  // Self-host opt-out. On a private, single-consumer instance (e.g. only a
+  // single trusted backend reaching this over private networking) per-IP
+  // limiting has no threat model to defend and is actively harmful: internal
+  // server-to-server traffic carries no trusted client-IP header, so every
+  // request collapses into the shared UNKNOWN_CLIENT_IP bucket and a single
+  // 600/60s budget throttles the whole backend. RATE_LIMIT_DISABLED=true
+  // makes every check allow (fail-open), including failClosed callers.
+  if (process.env.RATE_LIMIT_DISABLED === 'true') return null;
+
   const rl = getRatelimit();
   if (!rl) {
     if (opts.failClosed) {
