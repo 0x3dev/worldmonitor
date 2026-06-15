@@ -748,13 +748,23 @@ function resolveConfig(options = {}) {
   const cloudFallback = mode === 'docker' ? false : requestedFallback;
   // Programmatic dev/test escape hatch only; CLI/env startup keeps private remoteBase blocked.
   const allowPrivateRemoteBase = options.allowPrivateRemoteBase === true;
-  // Programmatic-only test escape hatch for adding extra origins to the
+  // Programmatic test escape hatch for adding extra origins to the
   // private-fetch allowlist (e.g. distinct upstream test servers). Mirrors
-  // allowPrivateRemoteBase: no env-var path, so production startup can't
-  // widen the SSRF boundary by accident.
+  // allowPrivateRemoteBase.
+  //
+  // Self-hosted deployments also need this at startup: when Redis (the
+  // Upstash-compatible REST proxy) lives on a private network — e.g. a
+  // Railway `*.railway.internal` host or a docker-compose service — the SSRF
+  // guard would otherwise block every redis read/write. LOCAL_API_ALLOW_PRIVATE_FETCH_ORIGINS
+  // is a comma-separated, explicit opt-in: it widens the boundary only to the
+  // exact origins the operator names (and nothing else), the same trust model
+  // used for the internal LLM URL.
   const allowPrivateFetchOrigins = Array.isArray(options.allowPrivateFetchOrigins)
     ? options.allowPrivateFetchOrigins.filter((o) => typeof o === 'string' && o.length > 0)
-    : [];
+    : (process.env.LOCAL_API_ALLOW_PRIVATE_FETCH_ORIGINS || '')
+        .split(',')
+        .map((o) => o.trim())
+        .filter(Boolean);
   const logger = options.logger ?? console;
   if (mode === 'docker' && requestedFallback) {
     logger.warn('[local-api] Cloud fallback disabled in Docker mode (self-hosted instances must not proxy to api.worldmonitor.app)');
