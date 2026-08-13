@@ -1941,3 +1941,64 @@ test('service-status reports bound fallback port after EADDRINUSE recovery', asy
     });
   }
 });
+
+// Regression (prod incident 2026-08-13): six upstream sockets that accepted a
+// connection and never replied consumed every MAX_CONCURRENT_UPSTREAM slot.
+// Callers passed AbortSignal.timeout(), but the signal was only wired to the
+// socket AFTER the slot was acquired, so queued fetches ignored it and parked
+// forever — wedging every endpoint, /api/health included, until a redeploy.
+test('black-holed upstreams release their slots so later fetches still resolve', async () => {
+  const pending = [];
+  const blackhole = createServer((_req, res) => { pending.push(res); }); // never responds
+  const blackholePort = await listen(blackhole);
+  const live = createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const livePort = await listen(live);
+
+  process.env.WM_TEST_BLACKHOLE = `http://127.0.0.1:${blackholePort}/stall`;
+  process.env.WM_TEST_LIVE = `http://127.0.0.1:${livePort}/ok`;
+  process.env.LOCAL_API_ALLOW_PRIVATE_FETCH_ORIGINS =
+    `http://127.0.0.1:${blackholePort},http://127.0.0.1:${livePort}`;
+
+  const localApi = await setupApiDir({
+    'slot-drain.js': `
+      export default async function handler() {
+        // Saturate the limiter (MAX_CONCURRENT_UPSTREAM = 6) plus two queued.
+        const stalled = Array.from({ length: 8 }, () =>
+          fetch(process.env.WM_TEST_BLACKHOLE, { signal: AbortSignal.timeout(300) })
+            .then(() => 'resolved', (e) => e.name));
+        const outcomes = await Promise.all(stalled);
+        // The limiter must be drained — this one has to get through.
+        const after = await fetch(process.env.WM_TEST_LIVE, { signal: AbortSignal.timeout(2000) });
+        return Response.json({ outcomes, after: after.status });
+      }
+    `,
+  });
+
+  const app = await createLocalApiServer({
+    port: 0,
+    apiDir: localApi.apiDir,
+    logger: { log() { }, warn() { }, error() { } },
+  });
+  const { port } = await app.start();
+
+  try {
+    const response = await authFetch(`http://127.0.0.1:${port}/api/slot-drain`);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.outcomes.length, 8);
+    for (const outcome of body.outcomes) assert.equal(outcome, 'AbortError');
+    assert.equal(body.after, 200);
+  } finally {
+    delete process.env.WM_TEST_BLACKHOLE;
+    delete process.env.WM_TEST_LIVE;
+    delete process.env.LOCAL_API_ALLOW_PRIVATE_FETCH_ORIGINS;
+    await app.close();
+    await localApi.cleanup();
+    for (const res of pending) res.destroy();
+    await new Promise((resolve) => blackhole.close(resolve));
+    await new Promise((resolve) => live.close(resolve));
+  }
+});

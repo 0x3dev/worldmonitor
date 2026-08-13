@@ -83,22 +83,65 @@ function isTransientVerificationError(error) {
 }
 
 // Global concurrency limiter for upstream requests.
+//
+// Every waiter MUST be able to give up: a slot held by a socket that never
+// replies used to park the whole queue forever, because the caller's
+// AbortSignal was only wired to the socket *after* the slot was acquired.
+// Six black-holed upstreams were enough to wedge the entire API process —
+// health included — until a redeploy. So waiters honour their abort signal
+// while queued, and fall out on their own after UPSTREAM_QUEUE_WAIT_MS even
+// if the caller passed no signal at all.
 let _activeUpstream = 0;
+/** @type {Array<{ resolve: () => void, settled: boolean }>} */
 const _upstreamQueue = [];
 const MAX_CONCURRENT_UPSTREAM = 6;
-function acquireUpstreamSlot() {
+const UPSTREAM_QUEUE_WAIT_MS = Number(process.env.UPSTREAM_QUEUE_WAIT_MS || 15_000);
+/** Socket-inactivity ceiling for a held slot (see the fetch shim below). */
+const UPSTREAM_SOCKET_TIMEOUT_MS = Number(process.env.UPSTREAM_SOCKET_TIMEOUT_MS || 30_000);
+
+function makeAbortError(message) {
+  const error = new Error(message);
+  error.name = 'AbortError';
+  return error;
+}
+
+function acquireUpstreamSlot(signal) {
+  if (signal?.aborted) return Promise.reject(makeAbortError('Request aborted before upstream slot'));
   if (_activeUpstream < MAX_CONCURRENT_UPSTREAM) {
     _activeUpstream++;
     return Promise.resolve();
   }
-  return new Promise(resolve => _upstreamQueue.push(resolve));
+  return new Promise((resolve, reject) => {
+    const waiter = { settled: false, resolve: () => {} };
+    const finish = (fn) => {
+      if (waiter.settled) return;
+      waiter.settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      fn();
+    };
+    // The slot is handed over to us by releaseUpstreamSlot — accept it.
+    waiter.resolve = () => finish(resolve);
+    const onAbort = () => finish(() => reject(makeAbortError('Request aborted while queued for upstream slot')));
+    const timer = setTimeout(
+      () => finish(() => reject(makeAbortError('Timed out waiting for an upstream slot'))),
+      UPSTREAM_QUEUE_WAIT_MS,
+    );
+    if (typeof timer.unref === 'function') timer.unref();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    _upstreamQueue.push(waiter);
+  });
 }
+
 function releaseUpstreamSlot() {
-  if (_upstreamQueue.length > 0) {
-    _upstreamQueue.shift()();
-  } else {
-    _activeUpstream--;
+  // Skip waiters that already aborted or timed out — their slot claim is void.
+  while (_upstreamQueue.length > 0) {
+    const waiter = _upstreamQueue.shift();
+    if (waiter.settled) continue;
+    waiter.resolve();
+    return;
   }
+  _activeUpstream--;
 }
 
 // Global Yahoo Finance rate gate — shared across ALL handler bundles.
@@ -202,7 +245,7 @@ globalThis.fetch = async function ipv4Fetch(input, init) {
     ? { safe: true, resolvedAddresses: [url.hostname] }
     : await assertSafeSidecarFetchUrl(url);
   if (url.hostname.includes('finance.yahoo.com')) await sidecarYahooGate();
-  await acquireUpstreamSlot();
+  await acquireUpstreamSlot(init?.signal);
   try {
     const mod = url.protocol === 'https:' ? https : http;
     const method = init?.method || (isRequest ? input.method : 'GET');
@@ -230,9 +273,31 @@ globalThis.fetch = async function ipv4Fetch(input, init) {
       requestOptions.lookup = makePinnedLookup(pinned.address, pinned.family);
     }
     return await new Promise((resolve, reject) => {
+      let settled = false;
+      const signal = init?.signal;
+      const cleanup = () => signal?.removeEventListener('abort', onAbort);
+      const fail = (error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        req.destroy();
+        reject(error);
+      };
+      const succeed = (response) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(response);
+      };
+      // Explicit rejection, not just req.destroy(): destroying a ClientRequest
+      // without an error emits 'close' but no 'error', which would leave this
+      // promise — and the upstream slot it holds — pending forever.
+      const onAbort = () => fail(makeAbortError('Request aborted'));
+
       const req = mod.request(requestOptions, (res) => {
         const chunks = [];
         res.on('data', (c) => chunks.push(c));
+        res.on('error', fail);
         res.on('end', () => {
           const buf = Buffer.concat(chunks);
           const responseHeaders = new Headers();
@@ -240,14 +305,18 @@ globalThis.fetch = async function ipv4Fetch(input, init) {
             if (v) responseHeaders.set(k, Array.isArray(v) ? v.join(', ') : v);
           }
           try {
-            resolve(buildSafeResponse(res.statusCode, res.statusMessage, responseHeaders, buf));
+            succeed(buildSafeResponse(res.statusCode, res.statusMessage, responseHeaders, buf));
           } catch (error) {
-            reject(error);
+            fail(error);
           }
         });
       });
-      req.on('error', reject);
-      if (init?.signal) { init.signal.addEventListener('abort', () => req.destroy()); }
+      // Socket-inactivity ceiling. Covers both a connect that never completes
+      // and a response that stalls mid-body — the two ways an upstream can
+      // hold a slot indefinitely when the caller passes no signal.
+      req.setTimeout(UPSTREAM_SOCKET_TIMEOUT_MS, () => fail(makeAbortError('Upstream socket timed out')));
+      req.on('error', fail);
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
       if (body != null) req.write(body);
       req.end();
     });
